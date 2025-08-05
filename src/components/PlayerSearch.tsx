@@ -108,7 +108,7 @@ export function PlayerSearch({ onPlayerSelect, selectedPlayer }: PlayerSearchPro
       )}
 
       {selectedPlayer && (
-        <div className="mt-4 p-4 bg-secondary/30 rounded-lg border border-border">
+        <div className="mt-4 p-4 bg-secondary/30 rounded-lg border border-border relative z-10">
           <div className="flex items-center justify-between">
             <div>
               <h3 className="font-semibold text-foreground">{selectedPlayer.name}</h3>
