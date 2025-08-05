@@ -118,10 +118,13 @@ const Index = () => {
             onClick={handlePredict}
             disabled={!selectedPlayer || loading}
             size="lg"
-            className="bg-gradient-primary hover:shadow-orange transition-all duration-300 px-8 py-6 text-lg font-semibold"
+            className="bg-gradient-primary hover:shadow-orange transition-all duration-300 px-8 py-6 text-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? "Predicting..." : "Predict Next Game Points"}
           </Button>
+          {!selectedPlayer && (
+            <p className="text-sm text-muted-foreground mt-2">Select a player above to enable predictions</p>
+          )}
         </div>
 
         {/* Results Area */}
