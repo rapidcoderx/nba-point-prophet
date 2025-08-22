@@ -52,15 +52,6 @@ export default {
 					DEFAULT: 'hsl(var(--card))',
 					foreground: 'hsl(var(--card-foreground))'
 				},
-				// Basketball theme colors
-				court: {
-					wood: 'hsl(var(--court-wood))',
-					line: 'hsl(var(--court-line))'
-				},
-				basketball: 'hsl(var(--basketball-orange))',
-				nba: 'hsl(var(--nba-blue))',
-				success: 'hsl(var(--success))',
-				warning: 'hsl(var(--warning))',
 				sidebar: {
 					DEFAULT: 'hsl(var(--sidebar-background))',
 					foreground: 'hsl(var(--sidebar-foreground))',
@@ -93,52 +84,11 @@ export default {
 					to: {
 						height: '0'
 					}
-				},
-				'bounce-basketball': {
-					'0%, 20%, 50%, 80%, 100%': {
-						transform: 'translateY(0)'
-					},
-					'40%': {
-						transform: 'translateY(-10px)'
-					},
-					'60%': {
-						transform: 'translateY(-5px)'
-					}
-				},
-				'pulse-orange': {
-					'0%, 100%': {
-						opacity: '1'
-					},
-					'50%': {
-						opacity: '0.8'
-					}
-				},
-				'slide-up': {
-					'0%': {
-						transform: 'translateY(10px)',
-						opacity: '0'
-					},
-					'100%': {
-						transform: 'translateY(0)',
-						opacity: '1'
-					}
 				}
 			},
 			animation: {
 				'accordion-down': 'accordion-down 0.2s ease-out',
-				'accordion-up': 'accordion-up 0.2s ease-out',
-				'bounce-basketball': 'bounce-basketball 2s infinite',
-				'pulse-orange': 'pulse-orange 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-				'slide-up': 'slide-up 0.3s ease-out'
-			},
-			backgroundImage: {
-				'gradient-court': 'var(--gradient-court)',
-				'gradient-primary': 'var(--gradient-primary)',
-				'gradient-dark': 'var(--gradient-dark)'
-			},
-			boxShadow: {
-				'orange': 'var(--shadow-orange)',
-				'glow': 'var(--shadow-glow)'
+				'accordion-up': 'accordion-up 0.2s ease-out'
 			}
 		}
 	},
