@@ -1,0 +1,256 @@
+# === Imports ===
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+from xgboost import XGBRegressor
+
+# === NBA Utility Functions ===
+
+def get_player_id(player_name):
+    for player in players.get_players():
+        if player_name.lower() in player['full_name'].lower():
+            return player['id'], player['full_name']
+    return None, None
+
+def get_combined_player_logs(player_id, seasons=['2024-25'], last_n=200):
+    logs = []
+    for season in seasons:
+        df = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
+        df['SEASON'] = season
+        logs.append(df)
+    df = pd.concat(logs).sort_values("GAME_DATE", ascending=False).head(last_n)
+    return df
+
+def get_team_defense_stats(season='2024-25'):
+    df = leaguedashteamstats.LeagueDashTeamStats(season=season, measure_type_detailed_defense='Base', per_mode_detailed='PerGame').get_data_frames()[0]
+    if 'OPP_PTS' in df.columns:
+        df.rename(columns={'OPP_PTS': 'PTS_ALLOWED'}, inplace=True)
+    elif 'DEF_RATING' in df.columns:
+        df['PTS_ALLOWED'] = df['DEF_RATING']
+    elif 'PTS' in df.columns:
+        df.rename(columns={'PTS': 'PTS_ALLOWED'}, inplace=True)
+    return df[['TEAM_NAME', 'PTS_ALLOWED']]
+
+def get_team_abbreviation_map():
+    return {
+        'ATL': 'Atlanta Hawks', 'BOS': 'Boston Celtics', 'BKN': 'Brooklyn Nets',
+        'CHA': 'Charlotte Hornets', 'CHI': 'Chicago Bulls', 'CLE': 'Cleveland Cavaliers',
+        'DAL': 'Dallas Mavericks', 'DEN': 'Denver Nuggets', 'DET': 'Detroit Pistons',
+        'GSW': 'Golden State Warriors', 'HOU': 'Houston Rockets', 'IND': 'Indiana Pacers',
+        'LAC': 'LA Clippers', 'LAL': 'Los Angeles Lakers', 'MEM': 'Memphis Grizzlies',
+        'MIA': 'Miami Heat', 'MIL': 'Milwaukee Bucks', 'MIN': 'Minnesota Timberwolves',
+        'NOP': 'New Orleans Pelicans', 'NYK': 'New York Knicks', 'OKC': 'Oklahoma City Thunder',
+        'ORL': 'Orlando Magic', 'PHI': 'Philadelphia 76ers', 'PHX': 'Phoenix Suns',
+        'POR': 'Portland Trail Blazers', 'SAC': 'Sacramento Kings', 'SAS': 'San Antonio Spurs',
+        'TOR': 'Toronto Raptors', 'UTA': 'Utah Jazz', 'WAS': 'Washington Wizards'
+    }
+
+def join_defense_to_games(df):
+    team_map = get_team_abbreviation_map()
+    df['OPPONENT_ABBR'] = df['MATCHUP'].apply(lambda x: x.split()[-1])
+    df['OPPONENT_FULL'] = df['OPPONENT_ABBR'].map(team_map)
+
+    enriched = []
+    for season in df['SEASON'].unique():
+        season_df = df[df['SEASON'] == season].copy()
+        defense_df = get_team_defense_stats(season)
+        merged = pd.merge(season_df, defense_df, left_on='OPPONENT_FULL', right_on='TEAM_NAME', how='left')
+        enriched.append(merged)
+    return pd.concat(enriched, ignore_index=True)
+
+def build_features(df):
+    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+    df = df.sort_values('GAME_DATE')
+    df['MIN'] = pd.to_numeric(df['MIN'], errors='coerce')
+    df['PTS_PER_MIN_AVG'] = (df['PTS'].shift(1) / df['MIN'].shift(1)).rolling(5).mean()
+    df['PTS_EWA'] = df['PTS'].ewm(span=5).mean().shift(1)
+    df['HOME'] = df['MATCHUP'].str.contains('vs.').astype(int)
+    df['GAME_NUM'] = range(1, len(df) + 1)
+    df['DAYS_SINCE_LAST'] = df['GAME_DATE'].diff().dt.days.fillna(3)
+    df['BACK_TO_BACK'] = (df['DAYS_SINCE_LAST'] <= 1).astype(int)
+    df['OPPONENT'] = df['MATCHUP'].apply(lambda x: x.split()[-1])
+    df['OPPONENT_ENC'] = LabelEncoder().fit_transform(df['OPPONENT'])
+    df['PTS_LAST5'] = df['PTS'].rolling(5).mean().shift(1)
+    df['OPP_PTS_ALLOWED'] = df['PTS_ALLOWED']
+    df['MINUTES_AVG_LAST5'] = df['MIN'].shift(1).rolling(5).mean()
+    df['EXPECTED_MIN'] = df['MINUTES_AVG_LAST5']
+    df['PTS_VS_OPP_AVG'] = 0.0
+    df['STREAK'] = df['PTS'].diff().fillna(0).rolling(3).mean().shift(1)
+
+    for i in range(len(df)):
+        opp = df.loc[i, 'OPPONENT']
+        date = df.loc[i, 'GAME_DATE']
+        recent = df[(df['OPPONENT'] == opp) & (df['GAME_DATE'] < date)].sort_values('GAME_DATE', ascending=False).head(3)
+        if not recent.empty:
+            df.loc[i, 'PTS_VS_OPP_AVG'] = recent['PTS'].mean()
+
+    df = df.dropna().reset_index(drop=True)
+    features = df[['PTS_LAST5', 'PTS_EWA', 'HOME', 'OPPONENT_ENC', 'OPP_PTS_ALLOWED',
+                   'DAYS_SINCE_LAST', 'BACK_TO_BACK', 'GAME_NUM', 'PTS_VS_OPP_AVG',
+                   'PTS_PER_MIN_AVG', 'EXPECTED_MIN','STREAK']]
+    target = df['PTS']
+    return features, target
+
+# === VAE Model ===
+
+class ResidualDataset(Dataset):
+    def __init__(self, X, residuals):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.residuals = torch.tensor(residuals, dtype=torch.float32)
+
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.residuals[idx]
+
+class VAE(nn.Module):
+    def __init__(self, input_dim, latent_dim=4):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(input_dim, 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU())
+        self.mu = nn.Linear(32, latent_dim)
+        self.logvar = nn.Linear(32, latent_dim)
+        self.decoder = nn.Sequential(nn.Linear(latent_dim, 32), nn.ReLU(), nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1))
+
+    def reparameterize(self, mu, logvar,scale=1.0):
+        std, eps = torch.exp(0.5 * logvar), torch.randn_like(logvar)
+        return mu + eps * std
+
+    def forward(self, x):
+        h = self.encoder(x)
+        mu, logvar = self.mu(h), self.logvar(h)
+        z = self.reparameterize(mu, logvar,scale=2.0)
+        return self.decoder(z), mu, logvar
+
+def vae_loss_fn(recon_x, x, mu, logvar):
+    recon = nn.MSELoss()(recon_x, x)
+    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon + 0.001 * kl
+
+def train_vae(X, residuals, input_dim, epochs=50, batch_size=32):
+    model = VAE(input_dim)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loader = DataLoader(ResidualDataset(X, residuals), batch_size=batch_size, shuffle=True)
+    for _ in range(epochs):
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            recon, mu, logvar = model(xb)
+            loss = vae_loss_fn(recon, yb, mu, logvar)
+            loss.backward()
+            optimizer.step()
+    return model
+
+def sample_vae_residuals(model, X_tensor, scaler, num_samples=50):
+    model.eval()
+    all_samples = []
+    with torch.no_grad():
+        for i in range(len(X_tensor)):
+            x = X_tensor[i].unsqueeze(0).repeat(num_samples, 1)
+            h = model.encoder(x)
+            mu = model.mu(h)
+            logvar = model.logvar(h)
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+            recon = model.decoder(z).squeeze().cpu().numpy()
+            unscaled = scaler.inverse_transform(recon.reshape(-1, 1)).flatten()
+            all_samples.append(unscaled)
+    return all_samples
+
+# === Pipeline ===
+def run_pipeline_with_interval_and_violin(player_name="Shai Gilgeous-Alexander"):
+    pid, full_name = get_player_id(player_name)
+    if not pid:
+        print("Player not found.")
+        return
+
+    df = get_combined_player_logs(pid, ['2023-24', '2024-25'])
+    df = join_defense_to_games(df)
+    X, y = build_features(df)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=6, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    residuals = y_test.values - y_pred
+    scaler = StandardScaler()
+    residuals_scaled = scaler.fit_transform(residuals.reshape(-1, 1))
+    vae = train_vae(X_test.values, residuals_scaled, input_dim=X_test.shape[1])
+
+    X_tensor = torch.tensor(X_test.values, dtype=torch.float32)
+    sampled_residuals = sample_vae_residuals(vae, X_tensor, scaler, num_samples=100)
+    sampled_array = np.array(sampled_residuals)
+
+    # === Percentile-based interval prediction ===
+    p10 = np.percentile(sampled_array, 10, axis=1)
+    p50 = np.percentile(sampled_array, 50, axis=1)
+    p90 = np.percentile(sampled_array, 90, axis=1)
+
+    pred_p10 = y_pred + p10
+    pred_p50 = y_pred + p50
+    pred_p90 = y_pred + p90
+
+    # === Plot 1: Prediction interval plot ===
+    plt.figure(figsize=(14, 6))
+    x = np.arange(len(y_test))
+    plt.plot(x, y_test.values, label="Actual", marker='o', color='black')
+    plt.plot(x, y_pred, label="Base Prediction", linestyle='--', color='gray')
+    plt.plot(x, pred_p50, label="VAE Adjusted (Median)", color='blue', marker='x')
+    plt.fill_between(x, pred_p10, pred_p90, color='blue', alpha=0.2, label="VAE 10–90% Interval")
+    plt.title(f"{player_name} — Points Prediction with VAE Confidence Interval")
+    plt.xlabel("Test Game Index")
+    plt.ylabel("Points")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # === Plot 2: Violin plot ===
+    plt.figure(figsize=(18, 6))
+    sns.violinplot(data=pd.DataFrame(sampled_array), inner="quartile", palette="Spectral")
+    plt.title(f"{player_name} — VAE-Sampled Residual Distributions Per Game")
+    plt.xlabel("Test Game Index")
+    plt.ylabel("Sampled Residual (VAE)")
+    plt.tight_layout()
+    plt.show()
+    from sklearn.metrics import mean_absolute_error, r2_score
+
+    # Convert to NumPy arrays
+    actual = y_test.values
+    base_pred = y_pred
+    vae_lower = np.percentile(sampled_array + base_pred[:, None], 10, axis=1)
+    vae_upper = np.percentile(sampled_array + base_pred[:, None], 90, axis=1)
+    vae_median = np.median(sampled_array + base_pred[:, None], axis=1)
+
+    # === Metric Computation ===
+    mae_base = mean_absolute_error(actual, base_pred)
+    mae_vae = mean_absolute_error(actual, vae_median)
+
+    r2_base = r2_score(actual, base_pred)
+    r2_vae = r2_score(actual, vae_median)
+
+    coverage = np.mean((actual >= vae_lower) & (actual <= vae_upper)) * 100
+    avg_bandwidth = np.mean(vae_upper - vae_lower)
+
+    # === Display ===
+    print(f"\n=== Prediction Accuracy Metrics ===")
+    print(f"Base MAE: {mae_base:.2f}")
+    print(f"VAE Adjusted MAE: {mae_vae:.2f}")
+    print(f"Base R²: {r2_base:.2f}")
+    print(f"VAE Adjusted R²: {r2_vae:.2f}")
+    print(f"Interval Coverage (10–90%): {coverage:.1f}%")
+    print(f"Average Interval Width: {avg_bandwidth:.2f} points")
+
+
+# Run the new full pipeline
+run_pipeline_with_interval_and_violin("Joel Embiid")
+
+
